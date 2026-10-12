@@ -67,6 +67,23 @@ python preprocess/wavcaps/stats.py /home/voice/data/voice/WavCaps \
     --output /home/voice/data/voice/datasets/WavCaps/metadata/audit
 ```
 
+`--workers` defaults to **64 CPU processes**. Each process decodes one file;
+only small statistics return to the parent process, which writes the reports.
+At most `2 * workers` tasks are pending. A source with fewer files uses fewer
+processes. Worker results are collected in path order so totals and diagnostics
+remain identical to serial execution. Spawned workers work on Linux and macOS.
+
+```bash
+# Default: 64 workers
+python preprocess/wavcaps/stats.py /home/voice/data/voice/datasets/WavCaps
+# Reduce CPU / disk pressure, or use 1 for serial execution
+python preprocess/wavcaps/stats.py /home/voice/data/voice/datasets/WavCaps --workers 16
+```
+
+The worker count is not a promise of a 64x speedup: storage throughput and
+available CPU cores limit performance. For network disks or a quick header-only
+scan, fewer workers can be faster. `stats.json` records the requested worker count.
+
 `--sources soundbible` audits one source. The default scans all four sources.
 `--header-only` reads headers for a faster first inventory; it cannot establish
 that the whole audio decodes correctly. Default mode decodes every audio file

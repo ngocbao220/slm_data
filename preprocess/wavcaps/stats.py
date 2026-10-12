@@ -1,9 +1,12 @@
 """Audit extracted WavCaps against original metadata; never download or alter audio."""
 import argparse
 import ast
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
+from concurrent.futures import ProcessPoolExecutor
+from itertools import islice
 import json
 import math
+import multiprocessing
 from pathlib import Path
 import sys
 
@@ -27,11 +30,59 @@ def key(value):
     return (value[:-4] if value.lower().endswith('.wav') else value).lower()
 
 
-def audit(root, audio_root, output, sources, decode=True):
+def inspect_audio(path, decode):
+    """One independent file per process; return metadata, never audio buffers."""
+    result = {'path': path, 'bytes': 0}
+    try:
+        result['bytes'] = path.stat().st_size
+        with sf.SoundFile(path) as audio:
+            frames, rate, channels = len(audio), audio.samplerate, audio.channels
+            if frames <= 0 or rate <= 0:
+                raise ValueError('empty audio or invalid sample rate')
+            if decode:
+                decoded = 0
+                while True:
+                    block = audio.read(65536, dtype='float32', always_2d=True)
+                    if not len(block):
+                        break
+                    if not np.isfinite(block).all():
+                        raise ValueError('non-finite audio samples')
+                    decoded += len(block)
+                if decoded != frames:
+                    raise ValueError(f'decoded {decoded} frames, header claims {frames}')
+            result.update(duration=frames / rate, rate=rate, channels=channels)
+    except (OSError, RuntimeError, ValueError) as exc:
+        result['error'] = str(exc)
+    return result
+
+
+def inspect_files(paths, decode, workers):
+    """Bound pending work to 2 * workers and preserve sorted result order."""
+    count = min(workers, len(paths))
+    if count <= 1:
+        for path in paths:
+            yield inspect_audio(path, decode)
+        return
+    # Spawn avoids inheriting native-library thread state and works on macOS/Linux.
+    with ProcessPoolExecutor(max_workers=count, mp_context=multiprocessing.get_context('spawn')) as pool:
+        iterator = iter(paths)
+        pending = deque(pool.submit(inspect_audio, path, decode)
+                        for path in islice(iterator, 2 * count))
+        while pending:
+            result = pending.popleft().result()
+            path = next(iterator, None)
+            if path is not None:
+                pending.append(pool.submit(inspect_audio, path, decode))
+            yield result
+
+
+def audit(root, audio_root, output, sources, decode=True, workers=64):
+    if workers < 1:
+        raise ValueError('workers must be a positive integer')
     root, audio_root, output = Path(root).resolve(), Path(audio_root).resolve(), Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     report = {'dataset_root': str(root), 'audio_root': str(audio_root),
-              'verification': 'full_decode' if decode else 'header_only',
+              'verification': 'full_decode' if decode else 'header_only', 'workers': workers,
               'sources': {}, 'references': {'audio_flamingo_3': AF3,
               'wavcaps_counts': 'https://github.com/XinhaoMei/WavCaps'},
               'coverage_ok': True}
@@ -69,33 +120,21 @@ def audit(root, audio_root, output, sources, decode=True):
             source_audio = audio_root / folder
             paths = sorted(p for p in source_audio.rglob('*') if p.is_file() and p.suffix.lower() in EXTENSIONS)
             stats['audio_files'] = len(paths)
-            for n, path in enumerate(paths, 1):
+            for path in paths:
                 index[path.stem.lower()].append(path)
-                try:
-                    stats['audio_bytes'] += path.stat().st_size
-                    with sf.SoundFile(path) as audio:
-                        frames, rate, channel_count = len(audio), audio.samplerate, audio.channels
-                        if frames <= 0 or rate <= 0:
-                            raise ValueError('empty audio or invalid sample rate')
-                        if decode:
-                            decoded = 0
-                            while True:
-                                block = audio.read(65536, dtype='float32', always_2d=True)
-                                if not len(block):
-                                    break
-                                if not np.isfinite(block).all():
-                                    raise ValueError('non-finite audio samples')
-                                decoded += len(block)
-                            if decoded != frames:
-                                raise ValueError(f'decoded {decoded} frames, header claims {frames}')
-                        durations[path] = frames / rate
-                        rates[str(rate)] += 1
-                        channels[str(channel_count)] += 1
-                        stats['valid_audio_files'] += 1
-                        stats['all_audio_seconds'] += frames / rate
-                except (OSError, RuntimeError, ValueError) as exc:
-                    issue(source, 'unreadable_audio', path=str(path), error=str(exc))
+            print(f'[{source}] checking {len(paths)} audio files with {min(workers, len(paths))} workers', flush=True)
+            for n, result in enumerate(inspect_files(paths, decode, workers), 1):
+                path = result['path']
+                stats['audio_bytes'] += result['bytes']
+                if 'error' in result:
+                    issue(source, 'unreadable_audio', path=str(path), error=result['error'])
                     report['coverage_ok'] = False
+                else:
+                    durations[path] = result['duration']
+                    rates[str(result['rate'])] += 1
+                    channels[str(result['channels'])] += 1
+                    stats['valid_audio_files'] += 1
+                    stats['all_audio_seconds'] += result['duration']
                 if n % 1000 == 0 or n == len(paths):
                     print(f'[{source}] audio {n}/{len(paths)}', flush=True)
             seen, referenced = set(), set()
@@ -190,12 +229,15 @@ def main():
     parser.add_argument('--audio-root', type=Path, help='Directory containing the four source folders (default: PATH/audio)')
     parser.add_argument('--output', type=Path, help='Report directory (default: PATH/metadata/audit)')
     parser.add_argument('--sources', nargs='+', choices=list(SOURCES), default=list(SOURCES))
+    parser.add_argument('--workers', type=int, default=64, help='CPU worker processes (default: 64; 1 runs serially)')
     parser.add_argument('--header-only', action='store_true', help='Faster duration scan; does not prove audio decodability')
     args = parser.parse_args()
+    if args.workers < 1:
+        parser.error('--workers must be a positive integer')
     if not args.path.is_dir():
         parser.error(f'Dataset root does not exist: {args.path}')
     report = audit(args.path, args.audio_root or args.path / 'audio',
-                   args.output or args.path / 'metadata/audit', list(dict.fromkeys(args.sources)), not args.header_only)
+                   args.output or args.path / 'metadata/audit', list(dict.fromkeys(args.sources)), not args.header_only, args.workers)
     print(f'{report["total_matched_samples"]:,} matched samples; {report["total_matched_hours"]:.3f} hours; reports: {args.output or args.path / "metadata/audit"}')
     return 0 if report['coverage_ok'] and not report['issue_counts'] else 1
 
